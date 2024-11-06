@@ -1,4 +1,5 @@
 import math
+import torch
 from momentfm import MOMENTPipeline
 import torch.nn as nn
 
@@ -42,113 +43,99 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:, : x.size(1)]
         return self.dropout(x)
 
-def create_patch(xb, patch_len, stride, max_sequence_length):
 
-  """
-  xb: [bs x n_vars x seq_len ]
-  """
-
-  seq_len = max_sequence_length if max_sequence_length is not None else xb.shape[2]
-  mask = torch.ones(xb.shape)
-  num_patch = (max(seq_len, patch_len) - patch_len) // stride + 1
-  tgt_len = patch_len  + stride * num_patch
-  pd = tgt_len - seq_len
-  pad1 = (0, pd)
-  xb = F.pad(xb, pad1, "constant", 0)
-  mask = F.pad(mask, pad1, "constant", 0)
-  xb = xb.unfold(dimension=-1, size=patch_len, step=stride)                 # xb: [bs x n_vars x num_patch x patch_len]
-  mask = mask.unfold(dimension=-1, size=patch_len, step=stride)                 # xb: [bs x n_vars x num_patch x patch_len]
-  return xb, mask
-
-class MomentEEG(nn.Module):
+class MomentTransformer(nn.Module):
     def __init__(
         self,
         emb_size=512,
-        n_channels = 64,
+        n_channels = 16,
         patch_len = 512,
         stride = 512,
         max_sequence_length = 2560,
         **kwargs
       ):
-      super().__init__()
+        super().__init__()
 
-      self.tokenizer = MOMENTPipeline.from_pretrained(
-          "AutonLab/MOMENT-1-small",
-          model_kwargs={'task_name': 'embedding',
-                        'reduction': 'mean'},
+        self.patch_len = patch_len
+        self.stride = stride
+        self.n_channels = n_channels
+        self.positional_encoding = PositionalEncoding(emb_size)
+
+        self.channel_tokens = nn.Embedding(n_channels, emb_size)
+        self.index = nn.Parameter(
+            torch.LongTensor(range(n_channels)), requires_grad=False
         )
-      self.tokenizer.init()
-
-      self.patch_len = patch_len
-      self.stride = stride
-
-      self.positional_encoding = PositionalEncoding(emb_size)
-
-      # channel token, N_channels >= your actual channels
-      self.channel_tokens = nn.Embedding(n_channels, emb_size)
-      self.index = nn.Parameter(
-          torch.LongTensor(range(n_channels)), requires_grad=False
-      )
-      self.max_sequence_length = max_sequence_length
+        self.max_sequence_length = max_sequence_length
 
 
-    def forward(self, x, perturb = False):
+    def forward(self, x, perturb=False, saved_embeddings=None):
         """
         x: [batch_size, channel, num_patch, ts]
-        output: [batch_size, emb_size]
+        saved_embeddings: Pre-computed embeddings that bypass the `MomentEEG` forward pass.
         """
-        x, m = create_patch(x, patch_len = self.patch_len, stride = self.stride, max_sequence_length = self.max_sequence_length)
-        emb_seq = []
-        for i in range(x.shape[1]):
-            xb = x[:, i : i + 1, :, :].squeeze(1)
-            mb=  m[:, i : i + 1, :, :].squeeze(1)
-            bs, num_patch, patch_len = xb.shape
-            xb = torch.reshape(xb, (bs * num_patch, 1, patch_len))
-            mb = torch.reshape(mb, (bs * num_patch, 1, patch_len))
-            xb = self.tokenizer(x_enc = xb.detach()).embeddings
 
-            xb = torch.reshape(xb, (bs, num_patch, -1))
+        batch_size, ts, _ = x.shape
+        channel_emb = []
 
-            batch_size, ts, _ = xb.shape
-            # (batch_size, ts, emb)
+        for i in range(self.n_channels):
             channel_token_emb = (
                 self.channel_tokens(self.index[i])
                 .unsqueeze(0)
                 .unsqueeze(0)
                 .repeat(batch_size, ts, 1)
             )
-            # (batch_size, ts, emb)
-            channel_emb = self.positional_encoding(xb + channel_token_emb)
 
-            # perturb
-            if self.training and perturb:
-              ts = channel_emb.shape[1]
-              step = np.random.randint(2, ts)
-              if step < ts -1: # step = ts -1 means we do not perturb the sequence
-                  start_point = np.random.randint(1, ts - 1) # 1, ts -1  because we do not want to drop fisrt and last token
-                  drop_list = list(range(start_point, ts - 1, step))
-                  selected_ts = [i for i in range(ts) if i not in drop_list]
-                  channel_emb = channel_emb[:, selected_ts]
-            emb_seq.append(channel_emb)
+            emb_with_channel_pos = self.positional_encoding(x + channel_token_emb)
+            channel_emb.append(emb_with_channel_pos)
 
-        # (batch_size, 16 * ts, emb)
-        emb = torch.cat(emb_seq, dim=1)
+        emb = torch.cat(channel_emb, dim=1)  # (batch_size, 16 * ts, emb)
+
         # (batch_size, emb)
         emb = emb.mean(dim=1)
-        print('*'*20)
-        print(emb.shape)
+
         return emb
 
 
 
 # supervised classifier module
 class MomentClassifier(nn.Module):
-    def __init__(self, emb_size=512, n_classes=6, **kwargs):
+    def __init__(self, emb_size=512, n_channels=16, n_classes=6, **kwargs):
         super().__init__()
-        self.transformer = MomentEEG(emb_size, **kwargs)
-        self.classifier = ClassificationHead(emb_size, n_classes)
+        self.n_channels = n_channels
+        self.emb_size = emb_size
 
-    def forward(self, x, perturb = False):
-        x = self.transformer(x, perturb = perturb)
-        x = self.classifier(x)
-        return x
+        self.positional_encoding = PositionalEncoding(emb_size)
+
+        self.channel_tokens = nn.Embedding(n_channels, emb_size)
+        self.index = nn.Parameter(torch.LongTensor(range(n_channels)), requires_grad=False)
+
+        self.classifier = nn.Linear(emb_size, n_classes)
+
+    def forward(self, x, perturb=False, saved_embeddings=None):
+        """
+        x: [batch_size, channel, num_patch, ts]
+        saved_embeddings: Pre-computed embeddings that bypass the `MomentEEG` forward pass.
+        """
+
+        batch_size, ts, _ = x.shape
+        channel_emb = []
+
+        for i in range(self.n_channels):
+            channel_token_emb = (
+                self.channel_tokens(self.index[i])
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .repeat(batch_size, ts, 1)
+            )
+
+            emb_with_channel_pos = self.positional_encoding(x + channel_token_emb)
+            channel_emb.append(emb_with_channel_pos)
+
+        emb = torch.cat(channel_emb, dim=1)  # (batch_size, 16 * ts, emb)
+
+
+        # (batch_size, emb)
+        emb = emb.mean(dim=1)
+        
+        emb = self.classifier(emb)
+        return emb
