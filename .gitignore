@@ -3,3 +3,7 @@ dataset
 dataset/
 /dataset/
 *.log
+/log
+log
+log/
+/log/
