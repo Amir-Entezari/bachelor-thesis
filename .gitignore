@@ -2,3 +2,4 @@ dataset
 /dataset
 dataset/
 /dataset/
+*.log
